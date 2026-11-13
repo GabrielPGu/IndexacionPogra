@@ -25,11 +25,42 @@ public final class SystemTest {
             faults(root.resolve("fallo"));
             articles(root.resolve("articulos"));
             publication(root.resolve("publicacion"));
+            stress64Files(root.resolve("estres"));
             if (args.length == 1 && args[0].equals("--offset-grande")) largeOffset(root.resolve("grande.dat"));
             System.out.println("Pruebas correctas");
         } finally {
             Store.removeTree(root);
         }
+    }
+
+    private static void stress64Files(Path path) throws Exception {
+        int files = Store.MAX_FILES;
+        int length = DataFile.MAX_RECORD - DataFile.PREFIX - Integer.BYTES - 32;
+        String[] fields = {"x".repeat(length)};
+        var schema = new DataFile.Schema("estres", new String[]{"detalle"});
+        long records = 3L * files;
+        try (var store = new Store(path)) {
+            var initial = new Store.Manifest(1, files, records, files, "");
+            Files.createDirectory(store.version(initial.version()));
+            for (int file = 0; file < files; file++) {
+                try (var out = new DataFile.Writer(store.data(initial, file), schema)) {
+                    out.write(file + 1L, false, fields);
+                    out.write(file + 1L + files, true, fields);
+                    out.write(file + 1L + 2L * files, false, fields);
+                }
+            }
+            store.initialize(initial);
+            var indexed = store.index(8);
+            store.verify(indexed);
+            check(store.search(2L * files) == null, "El índice incluye un registro eliminado");
+            var packed = store.pack(8);
+            check(packed.fileCount() == files && packed.active() == 2L * files && packed.deleted() == 0,
+                    "Conteos de compactación con 64 archivos");
+            store.verify(packed);
+            check(store.search(records).row().field(0).equals(fields[0]), "Contenido tras compactar 64 archivos");
+        }
+        System.out.printf("Estrés verificado: %d archivos, %d registros, %d bytes por cuerpo, heap máximo %d bytes%n",
+                files, records, DataFile.MAX_RECORD - 32, Runtime.getRuntime().maxMemory());
     }
 
     private static void equivalence(Path path, long count, int files, int percent) throws Exception {

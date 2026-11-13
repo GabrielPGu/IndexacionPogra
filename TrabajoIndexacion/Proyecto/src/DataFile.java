@@ -156,9 +156,14 @@ final class DataFile {
         private final long size;
         private long offset;
         final Schema schema;
-        final Row row = new Row();
+        final Row row;
 
         Reader(Path path) throws IOException {
+            this(path, new Row());
+        }
+
+        Reader(Path path, Row row) throws IOException {
+            this.row = row;
             this.path = path;
             size = Files.size(path);
             in = new DataInputStream(new BufferedInputStream(Files.newInputStream(path), BUFFER));

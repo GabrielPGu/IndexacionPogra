@@ -402,6 +402,8 @@ final class Store implements Closeable {
 
     private static final class Readers implements Closeable {
         final DataFile.Reader[] files;
+        // verifyRows consume cada fila antes de avanzar cualquier lector.
+        private final DataFile.Row sharedRow = new DataFile.Row();
         final long[] last;
         final boolean[] seen;
         final boolean[] articleFile;
@@ -414,7 +416,7 @@ final class Store implements Closeable {
         }
 
         void open(int file, Path path) throws IOException {
-            files[file] = new DataFile.Reader(path);
+            files[file] = new DataFile.Reader(path, sharedRow);
             articleFile[file] = ArticleIndex.KEY.column(files[file].schema) >= 0;
         }
 

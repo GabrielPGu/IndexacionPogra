@@ -62,17 +62,20 @@ Los números se escriben en big-endian. Los offsets son posiciones absolutas de 
 - `PACK()` copia los cuerpos activos a archivos nuevos, verifica los conteos y reconstruye los índices con offsets nuevos. El manifiesto cambia después de validar la nueva versión. Si ocurre un fallo, se espera a los trabajadores y se retiran los archivos que el manifiesto no referencia. Tras corregir la causa, se puede reintentar en la misma instancia. Una vez publicada la nueva versión, se retira la anterior. El tamaño informado corresponde a bytes de los archivos, incluido el efecto de los encabezados.
 - El bloqueo del almacén cubre toda la operación, incluidas las consultas, y da acceso a un proceso por vez. Un trabajador fallido impide la publicación. Los archivos nuevos se sincronizan con `FileDescriptor.sync()`. Si el sistema de archivos no admite reemplazo atómico del manifiesto, la publicación falla y se conserva la versión activa. En la siguiente apertura se recupera el diario de borrado y se limpian temporales y versiones sin publicar. La durabilidad ante un corte eléctrico depende del sistema de archivos y de su manejo de los cambios de directorio.
 
-El trabajo en memoria está acotado por el número de trabajadores y los límites de formato. Hay hasta 8 hilos, 64 archivos, 256 campos por registro y 1 MiB por cuerpo de registro por defecto. Puede ajustarse ese último límite con `-Dlsdfms.maxRecord=<bytes>` y debe mantenerse compatible al reabrir el almacén. Se usan buffers de E/S de 64 KiB. Cada trabajador de indexación usa 2 MiB para ordenar su corrida. La verificación global mantiene un lector por archivo. El tamaño total de las tablas determina las corridas en disco y sus pasadas de fusión.
+El trabajo en memoria está acotado por el número de trabajadores y los límites de formato. Hay hasta 8 hilos, 64 archivos, 256 campos por registro y 1 MiB por cuerpo de registro por defecto. Puede ajustarse ese último límite con `-Dlsdfms.maxRecord=<bytes>` y debe mantenerse compatible al reabrir el almacén. Se usan buffers de E/S de 64 KiB. Cada trabajador de indexación usa 2 MiB para ordenar su corrida. La verificación global mantiene un lector por archivo y reutiliza un solo buffer de registro entre ellos. El tamaño total de las tablas determina las corridas en disco y sus pasadas de fusión.
 
 ## Pruebas y benchmark
 
 ```powershell
 java -Xmx64m -cp out SystemTest
 java -Xmx64m -cp out SystemTest --offset-grande
+java -Xmx64m -cp out HmFlowTest ../DatasetHyM storage/hm-cierre
 java -Xmx64m -cp out Main benchmark results/mi-medicion.csv 1000000 8 30 3 2 4 8
 ```
 
 Las pruebas comparan byte a byte las salidas serial y paralela, ejercitan la consulta secundaria y verifican el reintento en la misma instancia tras un fallo de trabajador. También simulan una interrupción de hilo y terminan procesos independientes después de escribir los datos, antes del reemplazo atómico del manifiesto y después del reemplazo. La opción de offset grande requiere espacio para un archivo de algo más de 2 GiB y comprueba `seek()` más allá de ese umbral.
+
+`SystemTest` incluye 64 archivos con tres registros por archivo, cada cuerpo a 32 bytes del límite de 1 MiB. `HmFlowTest` importa los tres CSV completos, ejecuta INDEX, elimina un artículo de prueba, ejecuta PACK y verifica ambos índices al reabrir. Usa una ruta nueva bajo un directorio existente, como `storage`, con al menos 12 GiB libres durante la ejecución. Consulta la [evidencia de cierre](results/validacion-cierre.md).
 
 El benchmark usa datos sintéticos. Cada muestra parte de una copia del mismo almacén y mide la operación completa, incluida la validación y publicación. La generación y copia quedan fuera del tiempo. Hay una ronda de calentamiento y el orden de los modos rota entre repeticiones. El CSV registra cada muestra, la mediana, mínimo, máximo, speedup, eficiencia, rendimiento, tamaños de datos e índice, tamaño de la última corrida temporal y espacio recuperado. El pico de heap es la suma de picos de los pools de heap de la JVM y puede sobreestimar el pico simultáneo. La caché del sistema operativo queda activa. El archivo de salida debe tener un nombre nuevo.
 
