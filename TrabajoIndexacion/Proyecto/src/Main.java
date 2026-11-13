@@ -19,6 +19,7 @@ public final class Main {
                   generar <almacen> <registros> <archivos> <porcentaje-eliminado>
                   index|pack <almacen> <hilos>
                   buscar|eliminar <almacen> <clave>
+                  buscar-articulo <almacen> <article_id>
                   verificar <almacen>
                   benchmark <csv-resultados> <registros> <archivos> <porcentaje> <repeticiones> <hilos>...
                 """);
@@ -28,7 +29,7 @@ public final class Main {
         switch (operation) {
             case "importar" -> require(args, 4, 5);
             case "generar" -> require(args, 5, 5);
-            case "index", "pack", "buscar", "eliminar" -> require(args, 3, 3);
+            case "index", "pack", "buscar", "buscar-articulo", "eliminar" -> require(args, 3, 3);
             case "verificar" -> require(args, 2, 2);
             case "benchmark" -> {
                 require(args, 7, 6 + Parallel.MAX_THREADS - 1);
@@ -50,20 +51,10 @@ public final class Main {
                     threads = Integer.parseInt(args[2]);
                     manifest = operation.equals("index") ? store.index(threads) : store.pack(threads);
                 }
-                case "buscar" -> {
-                    long key = Long.parseLong(args[2]);
-                    DataFile.Found found = store.search(key);
-                    if (found == null) {
-                        System.out.println("Clave ausente: " + key);
-                        return;
-                    }
-                    System.out.println(found.schema().table() + " clave=" + key);
-                    String[] fields = found.row().fields();
-                    String[] columns = found.schema().columns();
-                    for (int i = 0; i < fields.length; i++) {
-                        String label = i < columns.length ? columns[i] : "campo " + (i + 1);
-                        System.out.println(label + " = " + fields[i]);
-                    }
+                case "buscar", "buscar-articulo" -> {
+                    var found = operation.equals("buscar")
+                            ? store.search(Long.parseLong(args[2])) : store.searchArticle(args[2]);
+                    printResult(found, args[2]);
                     return;
                 }
                 case "eliminar" -> {
@@ -82,6 +73,20 @@ public final class Main {
                     operation, manifest.version(), manifest.fileCount(), Math.min(threads, manifest.fileCount()),
                     manifest.total(), manifest.active(), manifest.deleted(), store.dataBytes(manifest),
                     store.indexBytes(manifest), (System.nanoTime() - start) / 1_000_000.0);
+        }
+    }
+
+    private static void printResult(DataFile.Found found, String requested) {
+        if (found == null) {
+            System.out.println("Clave ausente: " + requested);
+            return;
+        }
+        System.out.println(found.schema().table() + " clave=" + found.row().key);
+        String[] fields = found.row().fields();
+        String[] columns = found.schema().columns();
+        for (int i = 0; i < fields.length; i++) {
+            String label = i < columns.length ? columns[i] : "campo " + (i + 1);
+            System.out.println(label + " = " + fields[i]);
         }
     }
 

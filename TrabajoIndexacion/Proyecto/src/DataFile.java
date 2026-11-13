@@ -130,6 +130,17 @@ final class DataFile {
             return fields;
         }
 
+        String field(int column) throws IOException {
+            if (column < 0 || column >= fieldCount) throw new IOException("Falta el campo " + column + " en clave " + key);
+            buffer.position(PREFIX);
+            for (int i = 0; i < column; i++) {
+                int size = buffer.getInt();
+                buffer.position(buffer.position() + size);
+            }
+            int size = buffer.getInt();
+            return new String(buffer.array(), buffer.position(), size, StandardCharsets.UTF_8);
+        }
+
         long end() {
             return offset + Integer.BYTES + length;
         }
@@ -181,17 +192,25 @@ final class DataFile {
     record Found(Schema schema, Row row) {}
 
     static Found readAt(RandomAccessFile in, Path path, long offset, long key) throws IOException {
+        Found found = readAt(in, path, offset);
+        if (found.row.key != key) throw found.row.invalid(path, "clave del índice incorrecta");
+        return found;
+    }
+
+    static Found readAt(RandomAccessFile in, Path path, long offset) throws IOException {
         in.seek(0);
         Schema schema = readSchema(in);
-        long size = in.length();
-        if (offset < in.getFilePointer() || offset > size - Integer.BYTES) {
+        Row row = new Row();
+        readAt(in, path, offset, in.getFilePointer(), in.length(), row);
+        return new Found(schema, row);
+    }
+
+    static void readAt(RandomAccessFile in, Path path, long offset, long first, long size, Row row) throws IOException {
+        if (offset < first || offset > size - Integer.BYTES) {
             throw new IOException("Offset fuera de rango: " + path + "@" + offset);
         }
         in.seek(offset);
-        Row row = new Row();
         row.read(in, path, offset, size - offset);
-        if (row.key != key) throw row.invalid(path, "clave del índice incorrecta");
-        return new Found(schema, row);
     }
 
     private DataFile() {}

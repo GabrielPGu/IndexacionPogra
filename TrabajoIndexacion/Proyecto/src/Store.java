@@ -10,20 +10,38 @@ final class Store implements Closeable {
     static final int MAX_FILES = 64;
     private static final int MANIFEST_MAGIC = 0x4C534D46; // LSMF
     private static final int DELETE_MAGIC = 0x4C53444A; // LSDJ
+    private static final int MANIFEST_VERSION = 2;
     private final Path root;
     private final FileChannel lockChannel;
     private final FileLock lock;
+    private final PackCheckpoint checkpoint;
     private long tempBytes;
 
-    record Manifest(long version, int fileCount, long total, long deleted, String index) {
+    record Manifest(long version, int fileCount, long total, long deleted, String index, boolean articles) {
+        Manifest(long version, int fileCount, long total, long deleted, String index) {
+            this(version, fileCount, total, deleted, index, false);
+        }
+
         long active() { return total - deleted; }
 
-        Manifest indexed(String name) {
-            return new Manifest(version, fileCount, total, deleted, name);
+        Manifest indexed(String name, boolean withArticles) {
+            return new Manifest(version, fileCount, total, deleted, name, withArticles);
         }
     }
 
+    enum PackStage { DATA_WRITTEN, BEFORE_PUBLISH, AFTER_PUBLISH }
+
+    @FunctionalInterface
+    interface PackCheckpoint {
+        void reached(PackStage stage);
+    }
+
     Store(Path root) throws IOException {
+        this(root, stage -> {});
+    }
+
+    Store(Path root, PackCheckpoint checkpoint) throws IOException {
+        this.checkpoint = checkpoint;
         this.root = Files.createDirectories(root);
         lockChannel = FileChannel.open(root.resolve("store.lock"), StandardOpenOption.CREATE, StandardOpenOption.WRITE);
         try {
@@ -44,13 +62,17 @@ final class Store implements Closeable {
         Path path = root.resolve("active.meta");
         if (!Files.isRegularFile(path)) throw new IOException("Almacén sin importar o generar: " + root);
         try (var in = new DataInputStream(Files.newInputStream(path))) {
-            if (in.readInt() != MANIFEST_MAGIC || in.readInt() != DataFile.VERSION) {
+            int magic = in.readInt();
+            int format = in.readInt();
+            if (magic != MANIFEST_MAGIC || (format != 1 && format != MANIFEST_VERSION)) {
                 throw new IOException("Manifiesto inválido: " + path);
             }
-            Manifest manifest = new Manifest(in.readLong(), in.readInt(), in.readLong(), in.readLong(), in.readUTF());
+            Manifest manifest = new Manifest(in.readLong(), in.readInt(), in.readLong(), in.readLong(),
+                    in.readUTF(), format == MANIFEST_VERSION && in.readBoolean());
             if (manifest.version <= 0 || manifest.fileCount < 1 || manifest.fileCount > MAX_FILES
                     || manifest.total < 0 || manifest.deleted < 0 || manifest.deleted > manifest.total
                     || (!manifest.index.isEmpty() && !manifest.index.matches("index-[0-9a-f-]{36}\\.idx"))
+                    || (manifest.articles && manifest.index.isEmpty())
                     || in.read() != -1) {
                 throw new IOException("Metadatos inválidos: " + path);
             }
@@ -59,6 +81,9 @@ final class Store implements Closeable {
             }
             if (!manifest.index.isEmpty() && !Files.isRegularFile(index(manifest))) {
                 throw new IOException("Falta el índice publicado");
+            }
+            if (manifest.articles && !Files.isRegularFile(articleIndex(manifest))) {
+                throw new IOException("Falta el índice publicado de artículos");
             }
             return manifest;
         }
@@ -82,6 +107,10 @@ final class Store implements Closeable {
         return root.resolve(manifest.index);
     }
 
+    Path articleIndex(Manifest manifest) {
+        return root.resolve(manifest.index.replace(".idx", ".articles.idx"));
+    }
+
     Path work() throws IOException {
         return Files.createTempDirectory(root, ".work-");
     }
@@ -91,15 +120,18 @@ final class Store implements Closeable {
     }
 
     private void publish(Manifest manifest) throws IOException {
-        writeAtomic("active.meta", out -> {
-            out.writeInt(MANIFEST_MAGIC);
-            out.writeInt(DataFile.VERSION);
-            out.writeLong(manifest.version);
-            out.writeInt(manifest.fileCount);
-            out.writeLong(manifest.total);
-            out.writeLong(manifest.deleted);
-            out.writeUTF(manifest.index);
-        });
+        writeAtomic("active.meta", out -> writeManifest(out, manifest));
+    }
+
+    private static void writeManifest(DataOutputStream out, Manifest manifest) throws IOException {
+        out.writeInt(MANIFEST_MAGIC);
+        out.writeInt(MANIFEST_VERSION);
+        out.writeLong(manifest.version);
+        out.writeInt(manifest.fileCount);
+        out.writeLong(manifest.total);
+        out.writeLong(manifest.deleted);
+        out.writeUTF(manifest.index);
+        out.writeBoolean(manifest.articles);
     }
 
     private interface Encode {
@@ -107,6 +139,10 @@ final class Store implements Closeable {
     }
 
     private void writeAtomic(String name, Encode encode) throws IOException {
+        writeAtomic(name, encode, () -> {});
+    }
+
+    private void writeAtomic(String name, Encode encode, Runnable beforeMove) throws IOException {
         Path temp = Files.createTempFile(root, ".meta-", ".tmp");
         try {
             try (var file = new FileOutputStream(temp.toFile()); var out = new DataOutputStream(file)) {
@@ -114,6 +150,7 @@ final class Store implements Closeable {
                 out.flush();
                 file.getFD().sync();
             }
+            beforeMove.run();
             if (Thread.currentThread().isInterrupted()) throw new InterruptedIOException("Publicación interrumpida");
             Files.move(temp, root.resolve(name), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
         } catch (AtomicMoveNotSupportedException e) {
@@ -166,7 +203,8 @@ final class Store implements Closeable {
                 records.getFD().sync();
             }
             if (manifest.deleted == before) {
-                publish(new Manifest(manifest.version, manifest.fileCount, manifest.total, before + 1, manifest.index));
+                publish(new Manifest(manifest.version, manifest.fileCount, manifest.total,
+                        before + 1, manifest.index, manifest.articles));
             }
         }
         Files.delete(journal);
@@ -178,6 +216,13 @@ final class Store implements Closeable {
         if (entry == null) return null;
         DataFile.Found found = read(manifest, entry);
         return found.row().state == DataFile.ACTIVE ? found : null;
+    }
+
+    DataFile.Found searchArticle(String id) throws IOException {
+        long key = ArticleIndex.parse(id);
+        Manifest manifest = current();
+        if (!manifest.articles) throw new IOException("Ejecuta index sobre un almacén H&M para buscar por article_id");
+        return ArticleIndex.search(this, manifest, key);
     }
 
     private DataFile.Found read(Manifest manifest, DiskIndex.Entry entry) throws IOException {
@@ -195,16 +240,39 @@ final class Store implements Closeable {
 
     Manifest index(int threads) throws IOException {
         Manifest previous = current();
-        Manifest next = previous.indexed(newIndex());
-        buildIndex(next, threads);
-        publish(next);
+        Manifest next = previous.indexed(newIndex(), ArticleIndex.present(this, previous));
+        try {
+            buildIndex(next, threads);
+            publish(next);
+        } catch (IOException | RuntimeException e) {
+            cleanupAfterFailure(e);
+            throw e;
+        }
         cleanup();
         return next;
     }
 
     Manifest pack(int threads) throws IOException {
         Manifest previous = current();
-        Manifest next = new Manifest(previous.version + 1, previous.fileCount, previous.active(), 0, newIndex());
+        Manifest next = new Manifest(previous.version + 1, previous.fileCount, previous.active(), 0,
+                newIndex(), ArticleIndex.present(this, previous));
+        try {
+            copyActive(previous, next, threads);
+            checkpoint.reached(PackStage.DATA_WRITTEN);
+            buildIndex(next, threads);
+            publishPack(next);
+        } catch (IOException | RuntimeException e) {
+            cleanupAfterFailure(e);
+            throw e;
+        }
+        checkpoint.reached(PackStage.AFTER_PUBLISH);
+        cleanup();
+        return next;
+    }
+
+    private void copyActive(Manifest previous, Manifest next, int threads) throws IOException {
+        // Si una limpieza anterior quedó pendiente, esta versión sigue sin publicarse.
+        removeTree(version(next.version));
         Files.createDirectory(version(next.version));
         long[] copied = new long[next.fileCount];
         long[] discarded = new long[next.fileCount];
@@ -230,10 +298,20 @@ final class Store implements Closeable {
         if (active != previous.active() || deleted != previous.deleted) {
             throw new IOException("Los conteos de PACK no coinciden con el manifiesto");
         }
-        buildIndex(next, threads);
-        publish(next);
-        cleanup();
-        return next;
+    }
+
+    private void publishPack(Manifest manifest) throws IOException {
+        writeAtomic("active.meta", out -> writeManifest(out, manifest),
+                () -> checkpoint.reached(PackStage.BEFORE_PUBLISH));
+    }
+
+    private void cleanupAfterFailure(Exception failure) {
+        // Parallel.run espera a todos los trabajadores. El manifiesto decide qué archivos conservar.
+        try {
+            cleanup();
+        } catch (IOException e) {
+            failure.addSuppressed(e);
+        }
     }
 
     private void buildIndex(Manifest next, int threads) throws IOException {
@@ -242,6 +320,12 @@ final class Store implements Closeable {
             long entries = DiskIndex.build(this, next, work, index(next), threads);
             tempBytes = Files.size(work.resolve("sorted"));
             if (entries != next.active()) throw new IOException("Conteo de entradas incorrecto");
+            if (next.articles) {
+                Path articleWork = Files.createDirectory(work.resolve("articles"));
+                DiskIndex.build(this, next, articleWork, articleIndex(next), threads,
+                        ArticleIndex.MAGIC, ArticleIndex.KEY);
+                tempBytes += Files.size(articleWork.resolve("sorted"));
+            }
             verify(next);
         } finally {
             removeTree(work);
@@ -254,15 +338,16 @@ final class Store implements Closeable {
         } else {
             try (var entries = new DiskIndex.Cursor(index(manifest), DiskIndex.HEADER)) {
                 DiskIndex.header(entries.in, entries.remaining, manifest.version);
-                verifyRows(manifest, entries);
+                long articles = verifyRows(manifest, entries);
+                if (manifest.articles) ArticleIndex.verify(this, manifest, articles);
             }
         }
     }
 
     // Los importadores asignan claves crecientes dentro de cada archivo.
     // La validación cruza el índice con todos los registros en una pasada, sin búsquedas por registro.
-    private void verifyRows(Manifest manifest, DiskIndex.Cursor entries) throws IOException {
-        long[] counts = new long[2];
+    private long verifyRows(Manifest manifest, DiskIndex.Cursor entries) throws IOException {
+        long[] counts = new long[3];
         try (var rows = new Readers(manifest.fileCount)) {
             for (int file = 0; file < manifest.fileCount; file++) {
                 rows.open(file, data(manifest, file));
@@ -298,6 +383,7 @@ final class Store implements Closeable {
         if (counts[0] != manifest.total || counts[1] != manifest.deleted) {
             throw new IOException("Conteos de datos distintos del manifiesto");
         }
+        return counts[2];
     }
 
     private static boolean advance(Readers rows, int file, long[] counts) throws IOException {
@@ -310,6 +396,7 @@ final class Store implements Closeable {
         rows.last[file] = reader.row.key;
         counts[0]++;
         if (reader.row.state == DataFile.DELETED) counts[1]++;
+        else if (rows.articleFile[file]) counts[2]++;
         return true;
     }
 
@@ -317,15 +404,18 @@ final class Store implements Closeable {
         final DataFile.Reader[] files;
         final long[] last;
         final boolean[] seen;
+        final boolean[] articleFile;
 
         Readers(int count) {
             files = new DataFile.Reader[count];
             last = new long[count];
             seen = new boolean[count];
+            articleFile = new boolean[count];
         }
 
         void open(int file, Path path) throws IOException {
             files[file] = new DataFile.Reader(path);
+            articleFile[file] = ArticleIndex.KEY.column(files[file].schema) >= 0;
         }
 
         @Override
@@ -351,7 +441,8 @@ final class Store implements Closeable {
     }
 
     long indexBytes(Manifest manifest) throws IOException {
-        return manifest.index.isEmpty() ? 0 : Files.size(index(manifest));
+        if (manifest.index.isEmpty()) return 0;
+        return Files.size(index(manifest)) + (manifest.articles ? Files.size(articleIndex(manifest)) : 0);
     }
 
     long tempBytes() {
@@ -365,7 +456,7 @@ final class Store implements Closeable {
                 String name = path.getFileName().toString();
                 if (name.startsWith(".work-") || name.matches("\\.meta-\\d+\\.tmp")
                         || (name.matches("data-\\d+") && (active == null || !path.equals(version(active.version))))
-                        || (name.matches("index-[0-9a-f-]{36}\\.idx") && (active == null || !name.equals(active.index)))) {
+                        || (name.matches("index-[0-9a-f-]{36}(\\.articles)?\\.idx") && !isActiveIndex(active, path))) {
                     try {
                         removeTree(path);
                     } catch (IOException e) {
@@ -374,6 +465,11 @@ final class Store implements Closeable {
                 }
             }
         }
+    }
+
+    private boolean isActiveIndex(Manifest active, Path path) {
+        return active != null && (path.getFileName().toString().equals(active.index)
+                || (active.articles && path.equals(articleIndex(active))));
     }
 
     static void removeTree(Path path) throws IOException {

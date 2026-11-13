@@ -12,11 +12,26 @@ final class DiskIndex {
 
     record Entry(long key, int file, long offset) {}
 
+    interface KeySource {
+        int column(DataFile.Schema schema);
+        long key(DataFile.Row row, int column) throws IOException;
+    }
+
     static long build(Store store, Store.Manifest data, Path work, Path index, int threads) throws IOException {
+        return build(store, data, work, index, threads, MAGIC, null);
+    }
+
+    static long build(Store store, Store.Manifest data, Path work, Path index, int threads,
+                      int magic, KeySource source) throws IOException {
         int files = data.fileCount();
         Parallel.run(files, threads, file -> {
             Path directory = Files.createDirectory(work.resolve("file-" + file));
             try (DataFile.Reader reader = new DataFile.Reader(store.data(data, file))) {
+                int column = source == null ? 0 : source.column(reader.schema);
+                if (column < 0) {
+                    Files.createFile(run(work, 0, file));
+                    return;
+                }
                 long[] keys = new long[RUN_SIZE];
                 long[] offsets = new long[RUN_SIZE];
                 long[] keyScratch = new long[RUN_SIZE];
@@ -25,7 +40,7 @@ final class DiskIndex {
                 int size = 0;
                 while (reader.next()) {
                     if (reader.row.state == DataFile.DELETED) continue;
-                    keys[size] = reader.row.key;
+                    keys[size] = source == null ? reader.row.key : source.key(reader.row, column);
                     offsets[size++] = reader.row.offset;
                     if (size == RUN_SIZE) {
                         writeRun(run(directory, 0, runs++), file, size, keys, offsets, keyScratch, offsetScratch);
@@ -44,7 +59,7 @@ final class DiskIndex {
         try (FileOutputStream file = new FileOutputStream(index.toFile());
              DataOutputStream out = new DataOutputStream(new BufferedOutputStream(file, DataFile.BUFFER));
              InputStream in = Files.newInputStream(sorted)) {
-            out.writeInt(MAGIC);
+            out.writeInt(magic);
             out.writeInt(DataFile.VERSION);
             out.writeLong(data.version());
             out.writeLong(count);
@@ -187,7 +202,11 @@ final class DiskIndex {
     }
 
     static long header(DataInput in, long entries, long version) throws IOException {
-        if (in.readInt() != MAGIC || in.readInt() != DataFile.VERSION || in.readLong() != version) {
+        return header(in, entries, version, MAGIC);
+    }
+
+    static long header(DataInput in, long entries, long version, int magic) throws IOException {
+        if (in.readInt() != magic || in.readInt() != DataFile.VERSION || in.readLong() != version) {
             throw new IOException("Cabecera de índice inválida o versión incompatible");
         }
         long count = in.readLong();
@@ -196,11 +215,15 @@ final class DiskIndex {
     }
 
     static Entry find(Path path, long version, long key) throws IOException {
+        return find(path, version, key, MAGIC);
+    }
+
+    static Entry find(Path path, long version, long key, int magic) throws IOException {
         try (RandomAccessFile in = new RandomAccessFile(path.toFile(), "r")) {
             long size = in.length() - HEADER;
             if (size < 0 || size % ENTRY != 0) throw new IOException("Índice truncado: " + path);
             long low = 0;
-            long high = header(in, size / ENTRY, version) - 1;
+            long high = header(in, size / ENTRY, version, magic) - 1;
             while (low <= high) {
                 long middle = low + (high - low) / 2;
                 in.seek(HEADER + middle * ENTRY);
