@@ -1,1 +1,5 @@
 TrabajoIndexacion/DatasetHyM/*.zip
+TrabajoIndexacion/DatasetHyM/*.csv
+TrabajoIndexacion/Proyecto/out/
+TrabajoIndexacion/Proyecto/storage/
+TrabajoIndexacion/Proyecto/results/benchmark-*/
